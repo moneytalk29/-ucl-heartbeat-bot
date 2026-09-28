@@ -1,4 +1,4 @@
-import os
+port os
 import asyncio
 import datetime
 import discord
