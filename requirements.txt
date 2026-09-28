@@ -1,2 +1,2 @@
 discord.py
-curl_cffi==0.7.2
+curl_cffi
