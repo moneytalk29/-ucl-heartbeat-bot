@@ -1,4 +1,4 @@
-port os
+import os
 import asyncio
 import datetime
 import discord
@@ -48,7 +48,7 @@ def format_start(start):
         return str(start)
 
 def build_embed(row):
-    stat=row.get('stat','')
+    stat=row.get('stat') or ''
     return discord.Embed(title=row['player'],description=f"{stat} {row['line']} - {format_start(row['start'])}",color=0x00ff00)
 
 intents=discord.Intents.default()
@@ -59,37 +59,39 @@ first_run=True
 @tasks.loop(minutes=5)
 async def poll_loop():
     global first_run
-    ch=client.get_channel(CHAN_ID)
-    if not ch:
-        return
     try:
+        ch=client.get_channel(CHAN_ID)
+        if not ch:
+            print(f"Channel {CHAN_ID} not found - check DISCORD_CHANNEL_ID and bot access")
+            return
+
         payload=await fetch_markets()
-    except Exception as e:
-        print(f"Fetch error {e}")
-        return
-    if not payload:
-        print("Fetch failed")
-        return
+        if not payload:
+            print("Fetch failed")
+            return
 
-    rows=parse_props(payload)
-    print(f"Got {len(rows)} props")
+        rows=parse_props(payload)
+        print(f"Got {len(rows)} props")
 
-    if first_run:
+        if first_run:
+            for r in rows:
+                posted.add(r['id'])
+            first_run=False
+            print(f"First run seeded {len(posted)} - no spam")
+            return
+
         for r in rows:
+            if r['id'] in posted:
+                continue
             posted.add(r['id'])
-        first_run=False
-        print(f"First run seeded {len(posted)} - no spam")
-        return
-
-    for r in rows:
-        if r['id'] in posted:
-            continue
-        posted.add(r['id'])
-        try:
-            await ch.send(embed=build_embed(r))
-            await asyncio.sleep(1)
-        except Exception as e:
-            print('Send error',e)
+            try:
+                await ch.send(embed=build_embed(r))
+                await asyncio.sleep(1)
+            except Exception as e:
+                print('Send error',e)
+    except Exception as e:
+        # keep the loop alive if anything unexpected happens
+        print(f"Poll loop error: {e}")
 
 @poll_loop.before_loop
 async def before_poll():
