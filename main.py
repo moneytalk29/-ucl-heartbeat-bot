@@ -8,6 +8,7 @@ from discord.ext import tasks
 
 DISCORD_TOKEN = os.environ['DISCORD_TOKEN']
 CHANNEL_ID = int(os.environ['CHANNEL_ID_3'])
+PROXY_URL = os.getenv("PROXY_URL")  # <-- ADDED FIX
 
 API_URL = 'https://api.prizepicks.com/projections'
 PARAMS = {'league_id': '7', 'per_page': '250', 'single_stat': 'true'}
@@ -26,16 +27,31 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 posted_ids = set()
 
-
 async def fetch_projections():
     timeout = aiohttp.ClientTimeout(total=30)
+    # --- PROXY FIX ---
+    proxy = PROXY_URL or None
+    print(f"Using proxy: {'yes' if proxy else 'no'}")
+    
     async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
-        async with session.get(API_URL, params=PARAMS) as resp:
-            if resp.status != 200:
-                print('PrizePicks HTTP', resp.status)
-                return None
-            return await resp.json(content_type=None)
-
+        for attempt in range(1, 4):
+            try:
+                async with session.get(API_URL, params=PARAMS, proxy=proxy) as resp:
+                    print(f"PrizePicks {resp.status} (proxy={'yes' if proxy else 'no'}, attempt {attempt})")
+                    if resp.status == 403:
+                        print(f"403 - Retrying... attempt {attempt}")
+                        await asyncio.sleep(2)
+                        continue
+                    if resp.status != 200:
+                        print('PrizePicks HTTP', resp.status)
+                        return None
+                    return await resp.json(content_type=None)
+            except Exception as e:
+                print(f"PrizePicks error attempt {attempt}: {e}")
+                if attempt == 3:
+                    return None
+                await asyncio.sleep(2)
+    return None
 
 def parse_pass_attempts(payload):
     results = []
@@ -63,7 +79,6 @@ def parse_pass_attempts(payload):
         })
     return results
 
-
 def format_start(start):
     if not start:
         return 'TBD'
@@ -72,7 +87,6 @@ def format_start(start):
         return '<t:' + str(int(dt.timestamp())) + ':F>'
     except Exception:
         return str(start)
-
 
 def build_embed(row):
     line = row['line']
@@ -85,7 +99,6 @@ def build_embed(row):
     )
     embed.set_author(name='PrizePicks - Pass Attempts Are Up')
     return embed
-
 
 @tasks.loop(seconds=POLL_SECONDS)
 async def poll_loop():
@@ -118,17 +131,14 @@ async def poll_loop():
         except Exception as e:
             print('Send error:', e)
 
-
 @poll_loop.before_loop
 async def before_poll():
     await client.wait_until_ready()
-
 
 @client.event
 async def on_ready():
     print('Logged in as', client.user)
     if not poll_loop.is_running():
         poll_loop.start()
-
 
 client.run(DISCORD_TOKEN)
