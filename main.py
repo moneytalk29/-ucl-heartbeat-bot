@@ -1,40 +1,134 @@
-import os, requests, discord, asyncio
+import os
+import asyncio
 from datetime import datetime
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-CH = int(os.getenv("CHANNEL_ID_3", "0"))
+import aiohttp
+import discord
+from discord.ext import tasks
 
-bot = discord.Client(intents=discord.Intents.default())
+DISCORD_TOKEN = os.environ['DISCORD_TOKEN']
+CHANNEL_ID = int(os.environ['CHANNEL_ID_3'])
 
-def get_prizepicks_pass_attempts():
-    # PrizePicks API - soccer pass attempts
+API_URL = 'https://api.prizepicks.com/projections'
+PARAMS = {'league_id': '7', 'per_page': '250', 'single_stat': 'true'}
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Referer': 'https://app.prizepicks.com/',
+    'Origin': 'https://app.prizepicks.com',
+}
+
+POLL_SECONDS = 300
+PURPLE = 0x9B59B6
+
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+posted_ids = set()
+
+
+async def fetch_projections():
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
+        async with session.get(API_URL, params=PARAMS) as resp:
+            if resp.status != 200:
+                print('PrizePicks HTTP', resp.status)
+                return None
+            return await resp.json(content_type=None)
+
+
+def parse_pass_attempts(payload):
+    results = []
+    players = {}
+    for item in payload.get('included', []):
+        if item.get('type') == 'new_player':
+            attrs = item.get('attributes', {})
+            players[item.get('id')] = attrs.get('display_name') or attrs.get('name') or 'Unknown'
+
+    for prop in payload.get('data', []):
+        attrs = prop.get('attributes', {})
+        stat_type = str(attrs.get('stat_type', '')).lower()
+        if 'pass attempt' not in stat_type:
+            continue
+
+        rel = prop.get('relationships', {})
+        player_id = (rel.get('new_player', {}).get('data') or {}).get('id')
+        name = players.get(player_id, 'Unknown')
+
+        results.append({
+            'id': prop.get('id'),
+            'player': name,
+            'line': attrs.get('line_score'),
+            'start': attrs.get('start_time'),
+        })
+    return results
+
+
+def format_start(start):
+    if not start:
+        return 'TBD'
     try:
-        r = requests.get("https://api.prizepicks.com/projections?league_id=7", headers={"User-Agent":"Mozilla/5.0"})
-        data = r.json()
-        # Filter for Pass Attempts / Passes Attempted
-        props = []
-        for p in data.get("data", []):
-            stat = p["attributes"].get("stat_type", "").lower()
-            if "pass attempt" in stat or stat == "passes attempted" or stat == "pass attempts":
-                props.append(p)
-        return props
+        dt = datetime.fromisoformat(start)
+        return '<t:' + str(int(dt.timestamp())) + ':F>'
+    except Exception:
+        return str(start)
+
+
+def build_embed(row):
+    line = row['line']
+    date_text = format_start(row['start'])
+    description = str(line) + ' - Pass Attempts\n\nStarts ' + date_text + '\n'
+    embed = discord.Embed(
+        title=row['player'],
+        description=description,
+        color=PURPLE,
+    )
+    embed.set_author(name='PrizePicks - Pass Attempts Are Up')
+    return embed
+
+
+@tasks.loop(seconds=POLL_SECONDS)
+async def poll_loop():
+    channel = client.get_channel(CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(CHANNEL_ID)
+        except Exception as e:
+            print('Channel error:', e)
+            return
+
+    try:
+        payload = await fetch_projections()
     except Exception as e:
-        print(f"API Error: {e}")
-        return []
+        print('Fetch error:', e)
+        return
+    if not payload:
+        return
 
-@bot.event
+    rows = parse_pass_attempts(payload)
+    print('Pass attempt props found:', len(rows))
+
+    for row in rows:
+        if row['id'] in posted_ids:
+            continue
+        posted_ids.add(row['id'])
+        try:
+            await channel.send(embed=build_embed(row))
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            print('Send error:', e)
+
+
+@poll_loop.before_loop
+async def before_poll():
+    await client.wait_until_ready()
+
+
+@client.event
 async def on_ready():
-    print(f"Logged in {bot.user} - CH={CH}")
-    if CH == 0:
-        print("CHANNEL_ID_3 is 0 - fix in Railway!")
-        return
-        
-    channel = await bot.fetch_channel(CH)
-    props = get_prizepicks_pass_attempts()
-    
-    if not props:
-        print("No Pass Attempts found right now")
-        return
+    print('Logged in as', client.user)
+    if not poll_loop.is_running():
+        poll_loop.start()
 
-    for prop in props[:5]: # first 5
-        attrs = prop["attributes
+
+client.run(DISCORD_TOKEN)
