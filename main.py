@@ -1,4 +1,4 @@
-    rel = prop.get('relationships', {})
+rel = prop.get('relationships', {})
         player_id = (rel.get('new_player', {}).get('data') or {}).get('id')
         name = players.get(player_id, 'Unknown')
 
