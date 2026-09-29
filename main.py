@@ -1,107 +1,135 @@
-import os
-import asyncio
-import datetime
-import discord
-from discord.ext import tasks
-from curl_cffi.requests import AsyncSession
-from urllib.parse import quote
+import os, time, requests, re
+from datetime import datetime
+from difflib import SequenceMatcher
 
-TOKEN=os.getenv("DISCORD_TOKEN","").strip()
-CHAN_ID=int(os.getenv("DISCORD_CHANNEL_ID","0"))
-URL="https://api.prizepicks.com/projections?per_page=250&page={page}&single_stat=true&in_game=false&state_code=MA&game_mode=pickem"
+WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
+GAMMA = "https://gamma-api.polymarket.com"
+CLOB = "https://clob.polymarket.com"
 
-PROXY_URL=os.getenv("PROXY_URL","").strip() or None
-print(f"Proxy active: {bool(PROXY_URL)} -> {PROXY_URL[:30] if PROXY_URL else 'NONE'}")
+MIN_EDGE = 0.04 # 4c after fees
+SEEN = set()
 
-async def fetch_markets():
-    async with AsyncSession(impersonate="chrome120", timeout=25) as s:
-        out={'data':[],'included':[]}
-        for page in range(1,3):
-            for attempt in range(1,4):
-                try:
-                    r=await s.get(URL.format(page=page), proxy=PROXY_URL, headers={"Referer":"https://app.prizepicks.com/","Origin":"https://app.prizepicks.com"}, timeout=25)
-                    txt=r.text[:200].replace('\n',' ')
-                    print(f"p{page} {r.status_code} len={len(r.text)} {txt}")
-                    if r.status_code==200 and len(r.text)>1000:
-                        j=r.json()
-                        out['data'].extend(j.get('data',[]))
-                        out['included'].extend(j.get('included',[]))
-                        break
-                    if r.status_code==429:
-                        print("429 rate limit, sleep 30s")
-                        await asyncio.sleep(30)
-                    else:
-                        await asyncio.sleep(5*attempt)
-                except Exception as e:
-                    print(f"err p{page} a{attempt}: {e}")
-                    await asyncio.sleep(5)
-            await asyncio.sleep(6)
-        return out if out['data'] else None
+# Kalshi -> Polymarket tag map
+SPORT_MAP = {
+    "KXNFLGAME": "nfl",
+    "KXCFBGAME": "ncaaf",
+    "KXMLBGAME": "mlb",
+    "KXEPLGAME": "epl",
+    "KXATPMATCH": "atp",
+    "KXWTAMATCH": "wta",
+}
 
-def parse_props(payload):
-    if not payload: return []
-    data=payload.get('data',[]); inc=payload.get('included',[])
-    players={p.get('id'):p.get('attributes',{}).get('name','?') for p in inc if p.get('type')=='new_player'}
-    leagues={}
-    for it in inc:
-        if it.get('type')=='league':
-            leagues[it.get('id')] = it.get('attributes',{}).get('name','').lower()
-    player_league={}
-    for p in inc:
-        if p.get('type')=='new_player':
-            rel = p.get('relationships',{}).get('league',{}).get('data',{})
-            if rel: player_league[p.get('id')] = rel.get('id')
-    out=[]
-    for prop in data:
-        a=prop.get('attributes',{}); rel=prop.get('relationships',{})
-        pid=(rel.get('new_player',{}).get('data',{}) or {}).get('id')
-        lid = player_league.get(pid)
-        league_name = leagues.get(lid, '') if lid else ''
-        blob = f"{league_name} {a.get('description','')} {a.get('league','')} {a.get('stat_type','')}".lower()
-        is_soccer = any(x in blob for x in ['soccer','champions','ucl','uefa','mls','epl','premier','la liga','bundesliga'])
-        if not is_soccer: continue
-        out.append({'id':prop.get('id'),'player':players.get(pid,'?'),'line':a.get('line_score'),'start':a.get('start_time'),'stat':a.get('stat_type'),'league':league_name or 'soccer'})
-    return out
+def post(msg):
+    requests.post(WEBHOOK, json={"content": msg[:1900]}, timeout=10)
 
-def format_start(start):
-    if not start: return 'TBD'
+def get_kalshi_markets(series):
+    r = requests.get(f"{KALSHI}/markets", params={"series_ticker": series, "status": "open", "limit": 100}, timeout=10)
+    r.raise_for_status()
+    return r.json().get("markets", [])
+
+def get_poly_book(token_id):
     try:
-        dt=datetime.datetime.fromisoformat(start.replace('Z','+00:00'))
-        return f"<t:{int(dt.timestamp())}:t>"
-    except: return str(start)
+        r = requests.get(f"{CLOB}/book", params={"token_id": token_id}, timeout=8)
+        r.raise_for_status()
+        asks = r.json().get("asks", [])
+        if not asks: return 1.0, 0
+        best = min(asks, key=lambda x: float(x['price']))
+        return float(best['price']), float(best['size'])
+    except: return 1.0, 0
 
-def build_embed(row):
-    return discord.Embed(title=row['player'],description=f"⚽ {row['league']} | {row['stat']} {row['line']} - {format_start(row['start'])}",color=0x00ff00)
-
-intents=discord.Intents.default()
-client=discord.Client(intents=intents)
-posted=set()
-first_run=True
-
-@tasks.loop(minutes=5)
-async def poll_loop():
-    global first_run
+def get_poly_markets(tag):
     try:
-        ch=client.get_channel(CHAN_ID)
-        if not ch: return
-        payload=await fetch_markets()
-        if not payload: return
-        rows=parse_props(payload)
-        print(f"Got {len(rows)} SOCCER from {len(payload.get('data',[]))} total")
-        if first_run:
-            for r in rows: posted.add(r['id'])
-            first_run=False; print(f"Seeded {len(posted)}"); return
-        for r in rows:
-            if r['id'] in posted: continue
-            posted.add(r['id'])
-            try: await ch.send(embed=build_embed(r)); await asyncio.sleep(1)
-            except Exception as e: print('Send err',e)
-    except Exception as e: print(f"Loop err: {e}")
+        r = requests.get(f"{GAMMA}/markets", params={"tag": tag, "active": True, "closed": False, "limit": 100}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except: return []
 
-@poll_loop.before_loop
-async def before_poll(): await client.wait_until_ready()
-@client.event
-async def on_ready():
-    print('Logged in as',client.user)
-    if not poll_loop.is_running(): poll_loop.start()
-client.run(TOKEN)
+def similar(a,b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+# Preload seen
+for s in SPORT_MAP.keys():
+    try:
+        for m in get_kalshi_markets(s):
+            SEEN.add(m['ticker'])
+    except: pass
+
+post("✅ **FINAL SCANNER LIVE**\nNFL/CFB/MLB/Soccer/Tennis\nMoneyline + Props + Cross-Platform Kalshi vs Poly\nAlerts: PICK YES / PICK NO + 🚨")
+
+while True:
+    alerts = []
+    try:
+        for k_series, p_tag in SPORT_MAP.items():
+            k_markets = get_kalshi_markets(k_series)
+            p_markets = get_poly_markets(p_tag)
+
+            for km in k_markets[:30]:
+                ticker = km['ticker']
+                title = km.get('title','') + " " + km.get('yes_sub_title','')
+                ya = float(km.get('yes_ask_dollars') or 1)
+                na = float(km.get('no_ask_dollars') or 1)
+                yb = float(km.get('yes_bid_dollars') or 0)
+                total = ya + na
+                is_new = ticker not in SEEN
+                if is_new: SEEN.add(ticker)
+
+                # 1. LIVE ERROR INTRA Kalshi
+                if total < 0.98:
+                    alerts.append(f"🚨 **LIVE ERROR {k_series} — PICK YES+NO**\n`{ticker}`\nYES {ya*100:.0f}¢ + NO {na*100:.0f}¢ = {total*100:.0f}¢ | +{(1-total)*100:.0f}¢ FREE\n{title[:120]}")
+
+                # 2. LOW LINE
+                elif ya <= 0.20:
+                    alerts.append(f"🚨 **LOW LINE {k_series} — PICK YES @ {ya*100:.0f}¢**\n`{ticker}`\n{title[:120]}")
+                elif na <= 0.20:
+                    alerts.append(f"🚨 **LOW LINE {k_series} — PICK NO @ {na*100:.0f}¢**\n`{ticker}`\n{title[:120]}")
+
+                # 3. PROPS DROP
+                if is_new and ya < 0.35:
+                    alerts.append(f"🆕 **PROPS DROP {k_series} — PICK YES @ {ya*100:.0f}¢ (NEW)**\n`{ticker}`\n{title[:120]}")
+
+                # 4. CROSS-PLATFORM Kalshi vs Polymarket
+                # Find matching Poly market by name
+                for pm in p_markets[:30]:
+                    if similar(title, pm.get('question','')) > 0.65 or similar(km.get('ticker',''), pm.get('question','')) > 0.5:
+                        tokens = pm.get('clobTokenIds')
+                        if not tokens: continue
+                        try:
+                            import json
+                            tids = json.loads(tokens) if isinstance(tokens, str) else tokens
+                            py_ask, _ = get_poly_book(tids[0])
+                            pn_ask, _ = get_poly_book(tids[1])
+
+                            # Cross: Kalshi YES + Poly NO < 1
+                            cross1 = ya + pn_ask
+                            if cross1 < 1 - MIN_EDGE:
+                                alerts.append(
+                                    f"💰 **CROSS ARB {k_series} vs {p_tag.upper()}**\n"
+                                    f"**PICK YES Kalshi @ {ya*100:.0f}¢ + NO Poly @ {pn_ask*100:.0f}¢**\n"
+                                    f"Total {cross1*100:.0f}¢ | EDGE +{(1-cross1-0.02)*100:.0f}¢ net\n"
+                                    f"Kalshi: `{ticker}`\nPoly: {pm.get('question','')[:80]}"
+                                )
+                            # Other side
+                            cross2 = na + py_ask
+                            if cross2 < 1 - MIN_EDGE:
+                                alerts.append(
+                                    f"💰 **CROSS ARB {k_series} vs {p_tag.upper()}**\n"
+                                    f"**PICK NO Kalshi @ {na*100:.0f}¢ + YES Poly @ {py_ask*100:.0f}¢**\n"
+                                    f"Total {cross2*100:.0f}¢ | EDGE +{(1-cross2-0.02)*100:.0f}¢ net\n"
+                                    f"Kalshi: `{ticker}`"
+                                )
+                            break
+                        except: pass
+
+        if alerts:
+            for a in alerts[:6]:
+                post(a)
+                time.sleep(1)
+        else:
+            print(f"{datetime.now().strftime('%H:%M:%S')} clean — {len(SEEN)} tracked")
+
+    except Exception as e:
+        post(f"🚨 **BOT ERROR** {e}")
+        print(e)
+
+    time.sleep(20)
