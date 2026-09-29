@@ -6,33 +6,53 @@ from discord.ext import tasks
 from curl_cffi.requests import AsyncSession
 from urllib.parse import quote
 
-TOKEN=os.getenv("DISCORD_TOKEN")
+TOKEN=os.getenv("DISCORD_TOKEN","").strip()
 CHAN_ID=int(os.getenv("DISCORD_CHANNEL_ID","0"))
-URL="https://api.prizepicks.com/projections?per_page=250&page=1&single_stat=true&in_game=false&state_code=MA&game_mode=pickem"
+URL="https://api.prizepicks.com/projections?per_page=250&page={page}&single_stat=true&in_game=false&state_code=MA&game_mode=pickem"
 
-# Froxy proxy - handles ;;;; password
-PROXY_USER=os.getenv("PROXY_USER")
-PROXY_PASSWORD=os.getenv("PROXY_PASSWORD")
-PROXY_HOST=os.getenv("PROXY_HOST","proxy.froxy.com")
-PROXY_PORT=os.getenv("PROXY_PORT","9000")
-PROXY_URL=os.getenv("PROXY_URL")
+# --- PROXY FIX: strip spaces, prefer PROXY_URL ---
+PROXY_USER=os.getenv("PROXY_USER","").strip()
+PROXY_PASSWORD=os.getenv("PROXY_PASSWORD","").strip()
+PROXY_HOST=os.getenv("PROXY_HOST","proxy.froxy.com").strip()
+PROXY_PORT=os.getenv("PROXY_PORT","9000").strip()
+PROXY_URL=os.getenv("PROXY_URL","").strip() or None
 
-if PROXY_USER and PROXY_PASSWORD:
+if PROXY_USER and PROXY_PASSWORD and not PROXY_URL:
     enc_pwd = quote(PROXY_PASSWORD, safe='')
     PROXY_URL = f"http://{PROXY_USER}:{enc_pwd}@{PROXY_HOST}:{PROXY_PORT}"
 
+print(f"Using proxy: {'YES' if PROXY_URL else 'NO'} {PROXY_HOST}:{PROXY_PORT}")
+
 async def fetch_markets():
-    async with AsyncSession(impersonate="chrome") as s:
-        for i in range(1,4):
-            try:
-                r=await s.get(URL, proxy=PROXY_URL, headers={"Referer":"https://app.prizepicks.com/","Origin":"https://app.prizepicks.com"}, timeout=20)
-                print(f"PrizePicks {r.status_code} attempt {i}")
-                if r.status_code==200:
-                    return r.json()
-            except Exception as e:
-                print(f"Fetch {i} error: {e}")
-            await asyncio.sleep(2**i)
-    return None
+    async with AsyncSession(impersonate="chrome120", timeout=20) as s:
+        all_payload = {'data': [], 'included': []}
+        for page in range(1,6): # fetch 5 pages = 1250 props
+            for attempt in range(1,4):
+                try:
+                    url = URL.format(page=page)
+                    r=await s.get(url, proxy=PROXY_URL, headers={
+                        "Referer":"https://app.prizepicks.com/",
+                        "Origin":"https://app.prizepicks.com",
+                        "User-Agent":"Mozilla/5.0"
+                    })
+                    print(f"PrizePicks p{page} {r.status_code} attempt {attempt} len={len(r.text)}")
+                    if r.status_code==200:
+                        j=r.json()
+                        # DEBUG LOGGING
+                        if page==1:
+                            leagues_debug=set()
+                            for it in j.get('included',[]):
+                                if it.get('type')=='league':
+                                    leagues_debug.add(it.get('attributes',{}).get('name',''))
+                            print(f"Leagues on page1: {list(leagues_debug)[:20]} total_items={len(j.get('data',[]))}")
+                        all_payload['data'].extend(j.get('data',[]))
+                        all_payload['included'].extend(j.get('included',[]))
+                        break
+                except Exception as e:
+                    print(f"Fetch p{page} {attempt} error: {e}")
+                await asyncio.sleep(2**attempt)
+            await asyncio.sleep(0.8)
+        return all_payload if all_payload['data'] else None
 
 def parse_props(payload):
     if not payload:
@@ -57,8 +77,8 @@ def parse_props(payload):
         pid=(rel.get('new_player',{}).get('data',{}) or {}).get('id')
         lid = player_league.get(pid)
         league_name = leagues.get(lid, '') if lid else ''
-        blob = f"{league_name} {a.get('description','')} {a.get('league','')} {a.get('stat_type','')}".lower()
-        is_soccer = ('soccer' in blob or 'champions' in blob or 'ucl' in blob or 'uefa' in blob or 'mls' in blob or 'epl' in blob or 'la liga' in blob)
+        blob = f"{league_name} {a.get('description','')} {str(a.get('league',''))} {a.get('stat_type','')} {a.get('league_name','')}".lower()
+        is_soccer = any(x in blob for x in ['soccer','champions','ucl','uefa','mls','epl','premier league','la liga','bundesliga','ligue 1','serie a','ucl '])
         if not is_soccer:
             continue
         out.append({'id':prop.get('id'),'player':players.get(pid,'?'),'line':a.get('line_score'),'start':a.get('start_time'),'stat':a.get('stat_type'),'league':league_name or 'soccer'})
@@ -93,7 +113,7 @@ async def poll_loop():
         if not payload:
             return
         rows=parse_props(payload)
-        print(f"Got {len(rows)} SOCCER props from {len(payload.get('data',[]))}")
+        print(f"Got {len(rows)} SOCCER props from {len(payload.get('data',[]))} total")
         if first_run:
             for r in rows:
                 posted.add(r['id'])
